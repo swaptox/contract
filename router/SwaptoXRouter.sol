@@ -6,14 +6,22 @@ library ERC20Helper {
     /// @dev sentinel address used to represent native ETH
     address constant ETH_ADDRESS = address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
 
+    /// @dev Accepts standard ERC20 transfers that either return no data or a 32-byte true value.
+    function isERC20Success(bool success, bytes memory data) internal pure returns (bool) {
+        if (!success) return false;
+        if (data.length == 0) return true;
+        if (data.length < 32) return false;
+        return abi.decode(data, (bool));
+    }
+
     function safeTransferFrom(address token, address from, address to, uint256 value) internal {
         (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x23b872dd, from, to, value));
-        require(success && (data.length == 0 || abi.decode(data, (bool))), "SwaptoX: STF");
+        require(isERC20Success(success, data), "SwaptoX: STF");
     }
 
     function safeTransfer(address token, address to, uint256 value) internal {
         (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, to, value));
-        require(success && (data.length == 0 || abi.decode(data, (bool))), "SwaptoX: ST");
+        require(isERC20Success(success, data), "SwaptoX: ST");
     }
 
     /// @notice Safe ETH transfer helper that reverts on failure.
@@ -22,14 +30,21 @@ library ERC20Helper {
         require(success, "SwaptoX: ETH transfer failed");
     }
 
-    /// @dev Restricts execution to specific selectors (0xd505accf or 0x8fcbaf0c) 
-    /// to prevent arbitrary function calls via permitData.
+    /// @dev Restricts raw permit calldata to known permit selectors
+    ///      (0xd505accf or 0x8fcbaf0c) to prevent arbitrary token calls.
     function permit(address token, bytes calldata permitData) internal {
         require(permitData.length >= 4, "SwaptoX: invalid permit");
-        (bytes4 selector, bytes memory data) = abi.decode(permitData, (bytes4, bytes));
+        bytes4 selector;
+        assembly {
+            selector := and(
+                calldataload(permitData.offset),
+                0xffffffff00000000000000000000000000000000000000000000000000000000
+            )
+        }
         require(selector == 0xd505accf || selector == 0x8fcbaf0c, "SwaptoX: SELECTOR_FAILED");
-        (bool ok,) = token.call(abi.encodePacked(selector, data));
-        require(ok, "SwaptoX: PERMIT_FAILED");
+        bytes memory callData = permitData;
+        (bool ok,) = token.call(callData);
+        (ok); //Regardless of whether `ok` is true or false, execution proceeds; ultimately, `safeTransferFrom` serves as the final safeguard.
     }
 
     /// @dev Returns 0 if staticcall fails or the returned data is shorter than expected. 
@@ -56,15 +71,16 @@ contract OwnerContract {
     event SwaptoXTokenSet(bytes32 indexed opId, address token);
     event LadderSwitchChanged(bytes32 indexed opId, bool enabled);
     event FeeLadderUpdated(bytes32 indexed opId, FeeTier[] fees);
+    event Withdraw(address indexed sender, address indexed token, address indexed to, uint256 amount);
 
     /**
      * @notice Fee ladder tier definition.
      * @param amount Minimum token balance required to reach this tier
-     * @param discount Discount percentage applied to base fee (0–9999)
+     * @param discount Discount in basis points applied to the base fee (0-10000)
      */
     struct FeeTier {
         uint256 amount;
-        uint8 discount; // Range 0-9999
+        uint16 discount; // Range 0-10000
     }
 
     address public admin;
@@ -80,7 +96,7 @@ contract OwnerContract {
 
     /// @notice Default swap fee (basis points)
     /// default fee in basis points (1 BP = 0.01%)
-    /// capped to 100 BP (1%) by design
+    /// capped to 30 BP (0.3%) by design
     uint8 public defaultFeeBP = 0; 
 
     /// @notice Tokens that are completely exempt from swap fees
@@ -98,6 +114,7 @@ contract OwnerContract {
     }
 
     constructor(address _admin, uint256 _freeMonth) {
+        require(_admin != address(0), "SwaptoX: admin cannot be zero");
         admin = _admin;
         if(_freeMonth>0){
             maxFreeTime = block.timestamp + ((60*60*24*30)*_freeMonth);
@@ -106,7 +123,13 @@ contract OwnerContract {
 
 
     function _getOpId() internal view returns (bytes32 opId) {
-        opId = ITimelockContext(msg.sender).currentOpId();
+        if (msg.sender.code.length == 0) return bytes32(0);
+        (bool success, bytes memory data) = msg.sender.staticcall(
+            abi.encodeWithSelector(ITimelockContext.currentOpId.selector)
+        );
+        if (success && data.length >= 32) {
+            opId = abi.decode(data, (bytes32));
+        }
     }
 
 
@@ -128,7 +151,7 @@ contract OwnerContract {
      * @dev Fixes ambiguity between:
      * - token without custom fee
      * - token with custom fee set to zero
-     * - fee is capped at 100 BP (1%) by design
+     * - fee is capped at 30 BP (0.3%) by design
      *
      * If fee == 0:
      *   custom fee configuration is considered disabled.
@@ -157,6 +180,7 @@ contract OwnerContract {
     }
 
     /// @notice Set execution swap contract
+    /// @dev Overwriting existing versions is prohibited, ensuring that configured versions remain permanently available.
     function setSwapAddress(uint256 version, address _address) external onlySelf {
         require(_address != address(0), "SwaptoX: zero address");
         require(_address.code.length > 0, "SwaptoX: not contract");
@@ -179,14 +203,14 @@ contract OwnerContract {
      * Design constraints:
      * - Maximum tiers limited to 6 to prevent excessive gas usage
      * - Amounts must be strictly ascending
-     * - 100% discount is forbidden to prevent zero-fee abuse by bots
+     * - discount == 10000 is allowed and waives the fee for matched users
      */
     function setFeeLadder(FeeTier[] calldata fees) external onlySelf {
         uint len = fees.length;
         require(len <= 6, "SwaptoX: Too many tiers");
         delete feeTiers;
         for (uint i = 0; i < len; ++i) {
-            require(fees[i].discount < 10000, "SwaptoX: 100% discount restricted");
+            require(10000 >= fees[i].discount, "SwaptoX: Cannot exceed 10000");
             if (i > 0) {
                 require(fees[i].amount > fees[i-1].amount, "SwaptoX: Must be ascending");
             }
@@ -195,7 +219,7 @@ contract OwnerContract {
         emit FeeLadderUpdated(_getOpId(), fees);
     }
 
-    /// @notice Allows both the owner and the treasury wallet to withdraw funds.
+    /// @notice Withdraw accumulated protocol fees to the configured treasury wallet.
     function ownerWithdraw(address token, uint256 amount) external onlySelf {
         require(walletAddress != address(0), "SwaptoX: wallet not configured");
         if (address(token) == ERC20Helper.ETH_ADDRESS) {
@@ -213,6 +237,7 @@ contract OwnerContract {
      *
      * @dev Iterates from highest tier to lowest tier so that
      * the first matched tier gives the maximum discount.
+     * @return If 0 is returned, there is no discount.
      */
     function getFeeLadderDiscount(address account) public view returns (uint256) {
         uint256 len = feeTiers.length;
@@ -255,7 +280,7 @@ contract OwnerContract {
     /**
      * @notice Get effective swap fee in basis points
      *
-     * Ladder discount is applied last.
+     * Ladder discount is applied last. A 10000 BP discount returns a zero fee by design.
      */
     function getSwapFeeBP(address account, address token) public view returns (uint256) {
         uint256 baseFee = getTokenFeeBP(token);
@@ -310,11 +335,7 @@ contract InviterContract {
     /// - invalid inviters are ignored
     /// - usually called before a successful swap execution
     function bindInviter(address inviter) internal {
-        if (
-            inviter == address(0) ||
-            inviter == msg.sender ||
-            inviter == address(this)
-        ) return;// reject invalid inviters
+        if (inviter == address(0) || inviter == msg.sender) return;// reject invalid inviters
         if (inviterOf[msg.sender] != address(0)) return;// inviter already bound
         inviterOf[msg.sender] = inviter;
         inviteCount[inviter]++;// increase inviter statistics
@@ -329,24 +350,21 @@ contract InviterContract {
     function awardInviter(address token, uint256 swapVolume, uint feeAmount) internal {
         if (feeAmount < 100) return; // Skip tiny payouts (<100 units) to avoid wasting gas
         address inviter = inviterOf[msg.sender];
-        if (inviter != address(0)) {
-            uint inviterFeeAmount = feeAmount * getRewardBP(inviter) / 10000;
-            bool success;
-            if (token == ERC20Helper.ETH_ADDRESS) {
-                // limited gas prevents complex reentrancy patterns
-                (success, ) = payable(inviter).call{value: inviterFeeAmount, gas: 30000}("");
-            } else {
-                // low-level ERC20 transfer for maximum compatibility
-                (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, inviter, inviterFeeAmount));
-                if (ok && (data.length == 0 || abi.decode(data, (bool)))) {
-                    success = true;
-                }
-            }
-            if (success) {
-                emit InviterFeePaid(msg.sender, inviter, token, inviterFeeAmount, swapVolume);
-            } else {
-                emit InviterFeeFailed(msg.sender, inviter, token, inviterFeeAmount, swapVolume);
-            }
+        if (inviter == address(this) || inviter == address(0)) return;
+        uint inviterFeeAmount = feeAmount * getRewardBP(inviter) / 10000;
+        bool success;
+        if (token == ERC20Helper.ETH_ADDRESS) {
+            // limited gas prevents complex reentrancy patterns
+            (success, ) = payable(inviter).call{value: inviterFeeAmount, gas: 30000}("");
+        } else {
+            // low-level ERC20 transfer for maximum compatibility
+            (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, inviter, inviterFeeAmount));
+            success = ERC20Helper.isERC20Success(ok, data);
+        }
+        if (success) {
+            emit InviterFeePaid(msg.sender, inviter, token, inviterFeeAmount, swapVolume);
+        } else {
+            emit InviterFeeFailed(msg.sender, inviter, token, inviterFeeAmount, swapVolume);
         }
     }
 }
@@ -374,19 +392,22 @@ interface SwapExecutor {
     function entered(address sender, address tokenIn, uint256 amountMinOut, bytes calldata data, address recipient) external;
 }
 
-event Swapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, address recipient);
-event Withdraw(address indexed sender, address indexed token, address indexed to, uint256 amount);   
-
 contract SwaptoXRouter is OwnerContract, InviterContract {
+
+    event Swapped(address indexed sender, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut, address recipient);
+    event Deposited(address indexed sender, uint256 amount);
 
     address public immutable WETH;
 
     constructor(address _WETH, address _admin, uint256 _freeMonth) OwnerContract(_admin, _freeMonth) {
         require(_WETH != address(0), "SwaptoX: WETH cannot be zero");
+        require(_WETH.code.length > 0, "SwaptoX: WETH not contract");
         WETH = _WETH;
     }
 
-    receive() external payable {}
+    receive() external payable {
+        emit Deposited(msg.sender, msg.value);
+    }
 
     uint256 private unlocked = 1;
     modifier nonReentrant() {
@@ -545,42 +566,26 @@ contract SwaptoXRouter is OwnerContract, InviterContract {
      * @notice Public swap entrypoint. Caller provides deadline for optional anti-replay/anti-front-run.
      * @param desc SwapParameter describing the swap.
      * @param deadline Unix timestamp after which the call is invalid.
+     * @param referral Address to bind as referral. address(0) binds the platform address permanently.
      * @return amountOut Output amount delivered.
      * @return gasUsed Gas consumed by the operation (approximate).
      */
     function swap(
         SwapParameter calldata desc,
-        uint256 deadline
-    ) external payable nonReentrant ensure(deadline) returns (uint256 amountOut, uint256 gasUsed) {
-        uint256 gasBefore = gasleft();
-        amountOut = _swap(desc);
-        unchecked {
-            gasUsed = gasBefore - gasleft();
-        }
-    }
-
-	/**
-     * @notice Swap entrypoint that also binds an inviter for the caller.
-	 * @dev `bindInviter` is executed before the swap to associate referral relationships.
-     * @param desc SwapParameter describing the swap.
-     * @param deadline Unix timestamp after which the call is invalid.
-     * @param inviter Address to bind as inviter for msg.sender if not bound already.
-     * @return amountOut Output amount delivered.
-     * @return gasUsed Gas consumed by the operation (approximate).
-     */
-    function iSwap(
-        SwapParameter calldata desc,
         uint256 deadline,
-        address inviter
+        address referral
     ) external payable nonReentrant ensure(deadline) returns (uint256 amountOut, uint256 gasUsed) {
         uint256 gasBefore = gasleft();
-        bindInviter(inviter);
+        if (referral == address(0)) {
+            bindInviter(address(this));
+        }else{
+            bindInviter(referral);
+        }
         amountOut = _swap(desc);
         unchecked {
             gasUsed = gasBefore - gasleft();
         }
     }
-
 
     // @notice Wraps native ETH into WETH (Wrapped Token)
     function native2Wrapped(
@@ -589,7 +594,9 @@ contract SwaptoXRouter is OwnerContract, InviterContract {
     ) external payable nonReentrant ensure(deadline) returns (uint256 amountOut, uint256 gasUsed) {
         uint256 gasBefore = gasleft();
         require(address(desc.tokenIn) == ERC20Helper.ETH_ADDRESS, "SwaptoX: invalid tokenIn");
+        require(desc.tokenOut == WETH, "SwaptoX: invalid tokenOut");
         require(msg.value > 0&&msg.value == desc.amountIn, "SwaptoX: invalid amountIn");
+        require(desc.amountMinOut > 0 && desc.amountMinOut <= desc.amountIn, "SwaptoX: invalid amountMinOut");
         require(desc.recipient != address(0)&&desc.recipient != address(this), "SwaptoX: invalid recipient");
         uint256 realInput = msg.value;
         IWETH(WETH).deposit{value: realInput}();
@@ -610,7 +617,9 @@ contract SwaptoXRouter is OwnerContract, InviterContract {
     ) external nonReentrant ensure(deadline) returns (uint256 amountOut, uint256 gasUsed) {
         uint256 gasBefore = gasleft();
         require(desc.tokenIn == WETH, "SwaptoX: invalid tokenIn");
+        require(desc.tokenOut == ERC20Helper.ETH_ADDRESS, "SwaptoX: invalid tokenOut");
         require(desc.amountIn > 0, "SwaptoX: invalid amountIn");
+        require(desc.amountMinOut > 0, "SwaptoX: invalid amountMinOut");
         require(desc.recipient != address(0)&&desc.recipient != address(this), "SwaptoX: invalid recipient");
         uint256 realInput;
         if (desc.permitData.length > 0) {
