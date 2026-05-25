@@ -1,5 +1,29 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.4;
+pragma solidity 0.8.26;
+
+error NotOwner();
+error Unauthorized();
+error ZeroAddress();
+error DuplicateOwners();
+error GuardianConflict();
+error SameOwner();
+error InvalidOwner();
+error AlreadyOwner();
+error OwnerNotFound();
+error InvalidState();
+error Timelock();
+error GuardianNotActive();
+error InvalidGuardianOwner();
+error PendingExists();
+error NoPending();
+error NotContract();
+error TargetNotAllowed();
+error SelectorNotAllowed();
+error PendingLimit();
+error AlreadyExists();
+error NotFound();
+error AlreadyExecuted();
+error CallFailed();
 
 
 /**
@@ -21,8 +45,8 @@ pragma solidity ^0.8.4;
  * - During this delay, ANY active owner can cancel the activation at any time.
  *
  * Therefore:
- * - If at least TWO owners are active, guardian activation can always be prevented.
- * - Guardian can only become effective if governance is effectively stalled.
+ * - If at least one active owner monitors and responds during the delay, activation can be prevented.
+ * - Guardian should only become effective if governance is effectively stalled or no owner vetoes in time.
  *
  * === GUARDIAN POWERS ===
  *
@@ -85,7 +109,7 @@ contract Ownable3 {
     PendingOwnershipTransfer public pendingTransfer;
 
     modifier onlyOwner() {
-        require(_isOwner(msg.sender), "NOT_OWNER");
+        if (!_isOwner(msg.sender)) revert NotOwner();
         _;
     }
 
@@ -96,16 +120,16 @@ contract Ownable3 {
 
     uint256 private _reentrancyStatus = 1;
     modifier nonReentrant() {
-        require(_reentrancyStatus != 2, "REENTRANCY");
+        if (_reentrancyStatus == 2) revert InvalidState();
         _reentrancyStatus = 2;
         _;
         _reentrancyStatus = 1;
     }
 
     constructor(address owner1, address owner2, address owner3) {
-        require(owner1 != address(0) && owner2 != address(0) && owner3 != address(0), "ZERO_ADDRESS");
-        require(owner1 != owner2 && owner1 != owner3 && owner2 != owner3, "DUPLICATE_OWNERS");
-        require(owner1 != msg.sender && owner2 != msg.sender && owner3 != msg.sender, "GUARDIAN_CONFLICT");
+        if (owner1 == address(0) || owner2 == address(0) || owner3 == address(0)) revert ZeroAddress();
+        if (owner1 == owner2 || owner1 == owner3 || owner2 == owner3) revert DuplicateOwners();
+        if (owner1 == msg.sender || owner2 == msg.sender || owner3 == msg.sender) revert GuardianConflict();
         owners[0] = owner1;
         owners[1] = owner2;
         owners[2] = owner3;
@@ -119,11 +143,11 @@ contract Ownable3 {
      * @dev Must be called by the contract itself (address(this)) after 2-of-3 consensus.
      */
     function transferOwnership(address oldOwner, address newOwner) external {
-        require(msg.sender == address(this), "ONLY_SELF");
-        require(oldOwner != newOwner, "SAME_OWNER");
-        require(newOwner != address(0), "ZERO_ADDRESS");
-        require(_isOwner(oldOwner), "INVALID_OLD_OWNER");
-        require(!_isOwner(newOwner), "ALREADY_OWNER");
+        if (msg.sender != address(this)) revert Unauthorized();
+        if (oldOwner == newOwner) revert SameOwner();
+        if (newOwner == address(0)) revert ZeroAddress();
+        if (!_isOwner(oldOwner)) revert InvalidOwner();
+        if (_isOwner(newOwner)) revert AlreadyOwner();
         _transferOwnership(oldOwner, newOwner);
     }
 
@@ -136,9 +160,8 @@ contract Ownable3 {
             }
             unchecked { ++i; }
         }
-        revert("OWNER_NOT_FOUND");
+        revert OwnerNotFound();
     }
-
 
     /* ---------------------------- Rescue Mechanism --------------------------- */
 
@@ -161,13 +184,13 @@ contract Ownable3 {
      * - ANY owner can cancel during the delay period
      *
      * Implication:
-     * - If at least TWO owners are responsive, activation CANNOT succeed
-     * - Activation only succeeds when governance is effectively non-functional
+     * - Any responsive owner can veto activation during the delay
+     * - Activation only succeeds when no owner vetoes in time
      *
      * This prevents a single malicious owner from unilaterally activating guardian powers.
      */
     function proposeGuardianActivation() external onlyOwner {
-        require(!isGuardianActive && guardianActivationTime == 0, "GUARDIAN_ALREADY_PROPOSED");
+        if (isGuardianActive || guardianActivationTime != 0) revert InvalidState();
         guardianActivationTime = block.timestamp + GUARDIAN_DELAY;
         emit GuardianActivationProposed(msg.sender, block.timestamp);
     }
@@ -176,10 +199,10 @@ contract Ownable3 {
      * @notice Finalizes Guardian activation after the 10-day window.
      */
     function executeGuardianActivation() external onlyOwner {
-        require(guardianActivationTime != 0, "NOT_PROPOSED");
-        require(!isGuardianActive, "ALREADY_OPEN");
-        require(block.timestamp >= guardianActivationTime, "TIMELOCK");
+        if (guardianActivationTime == 0 || isGuardianActive) revert InvalidState();
+        if (block.timestamp < guardianActivationTime) revert Timelock();
         isGuardianActive = true;
+        guardianActivationTime = 0;
         emit GuardianActivationExecuted(msg.sender, block.timestamp);
     }
 
@@ -189,18 +212,23 @@ contract Ownable3 {
      * @dev This function is the primary safeguard against malicious or accidental
      * guardian activation proposals.
      *
-     * Any active owner can cancel at any time before activation.
+     * Any active owner can cancel before activation or deactivate Guardian mode after activation.
      *
-     * This guarantees that as long as governance is functional (>=2 active owners),
-     * the guardian mechanism cannot be enabled.
+     * This provides an on-chain veto during the delay, assuming active monitoring and response.
      */
     function cancelGuardianActivation() public onlyOwner {
+        _clearGuardianState();
+        if(guardianActivationTime>0){
+            emit GuardianActivationCancelled(msg.sender, block.timestamp);
+        }
+    }
+
+    function _clearGuardianState() internal {
         guardianActivationTime = 0;
         isGuardianActive = false;
         if (pendingTransfer.exists) {
             delete pendingTransfer;
         }
-        emit GuardianActivationCancelled(msg.sender, block.timestamp);
     }
 
     /**
@@ -219,14 +247,14 @@ contract Ownable3 {
      * unexpected or malicious ownership changes.
      */
     function proposeGuardianOwnershipTransfer(address oldOwner, address newOwner) external {
-        require(isGuardianActive, "GUARDIAN_NOT_ACTIVE");
-        require(msg.sender == guardian, "ONLY_GUARDIAN");
-        require(msg.sender != newOwner, "INVALID_NEW_OWNER");
-        require(oldOwner != newOwner, "SAME_OWNER");
-        require(!pendingTransfer.exists, "PENDING_EXISTS");
-        require(newOwner != address(0), "ZERO_ADDRESS");
-        require(_isOwner(oldOwner), "INVALID_OLD_OWNER");
-        require(!_isOwner(newOwner), "ALREADY_OWNER");
+        if (!isGuardianActive) revert GuardianNotActive();
+        if (msg.sender != guardian) revert Unauthorized();
+        if (msg.sender == newOwner) revert InvalidGuardianOwner();
+        if (oldOwner == newOwner) revert SameOwner();
+        if (pendingTransfer.exists) revert PendingExists();
+        if (newOwner == address(0)) revert ZeroAddress();
+        if (!_isOwner(oldOwner)) revert InvalidOwner();
+        if (_isOwner(newOwner)) revert AlreadyOwner();
         pendingTransfer = PendingOwnershipTransfer({
             oldOwner: oldOwner,
             newOwner: newOwner,
@@ -241,23 +269,28 @@ contract Ownable3 {
      * @notice Executed by the remaining active owner to confirm the Guardian's rescue proposal.
      */
     function executeGuardianOwnershipTransfer() external onlyOwner {
-        require(isGuardianActive, "GUARDIAN_NOT_ACTIVE");
-        require(pendingTransfer.exists, "NO_PENDING");
-        require(pendingTransfer.oldOwner != pendingTransfer.newOwner, "SAME_OWNER");
-        require(guardian != pendingTransfer.newOwner, "INVALID_NEW_OWNER");
-        require(block.timestamp >= pendingTransfer.executeAfter, "TIMELOCK");
-        require(!_isOwner(pendingTransfer.newOwner), "ALREADY_OWNER");
+        if (!isGuardianActive) revert GuardianNotActive();
+        if (!pendingTransfer.exists) revert NoPending();
+        PendingOwnershipTransfer memory transfer = pendingTransfer;
+        if (transfer.oldOwner == transfer.newOwner) revert SameOwner();
+        if (guardian == transfer.newOwner) revert InvalidGuardianOwner();
+        if (transfer.newOwner == address(0)) revert ZeroAddress();
+        if (block.timestamp < transfer.executeAfter) revert Timelock();
+        if (_isOwner(transfer.newOwner)) revert AlreadyOwner();
         bool replaced = false;
-        for (uint i = 0; i < 3; i++) {
-            if (owners[i] == pendingTransfer.oldOwner) {
-                emit GuardianOwnershipTransferExecuted(msg.sender, pendingTransfer.oldOwner, pendingTransfer.newOwner);
-                owners[i] = pendingTransfer.newOwner;
+        for (uint256 i = 0; i < 3; ) {
+            if (owners[i] == transfer.oldOwner) {
+                emit GuardianOwnershipTransferExecuted(msg.sender, transfer.oldOwner, transfer.newOwner);
+                owners[i] = transfer.newOwner;
                 replaced = true;
                 break;
             }
+            unchecked { ++i; }
         }
-        require(replaced, "OWNER_NOT_FOUND");
-        cancelGuardianActivation();// Cleanup: Guardian is deactivated once the system is restored to 2/3 health
+        if (!replaced) revert OwnerNotFound();
+        // Guardian is deactivated once the system is restored to 2/3 health.
+        _clearGuardianState();
+        emit GuardianActivationCancelled(msg.sender, block.timestamp);
     }
 
     /**
@@ -270,6 +303,14 @@ contract Ownable3 {
         }
     }
 
+    function updateGuardian(address newGuardian) external {
+        if (msg.sender != address(this)) revert Unauthorized();
+        if (newGuardian == address(0)) revert ZeroAddress();
+        if (_isOwner(newGuardian)) revert AlreadyOwner();
+        guardian = newGuardian;
+        _clearGuardianState();
+    }
+
 }
 
 
@@ -279,6 +320,7 @@ interface ITimelockActions {
     function transferOwnership(address oldOwner, address newOwner) external;
     function setAllowedTargets(address contractAddr, bool isopen) external;
     function setAllowedSelectors(address contractAddr, bytes4 selector, bool isopen) external;
+    function updateGuardian(address newGuardian) external;
 }
 
 /**
@@ -298,20 +340,21 @@ contract ConstantOperator {
         allowedSelectors[address(this)][ITimelockActions.transferOwnership.selector] = true;
         allowedSelectors[address(this)][ITimelockActions.setAllowedTargets.selector] = true;
         allowedSelectors[address(this)][ITimelockActions.setAllowedSelectors.selector] = true;
+        allowedSelectors[address(this)][ITimelockActions.updateGuardian.selector] = true;
     }
 
     function setAllowedTargets(address target, bool isAllowed) external {
-        require(msg.sender == address(this), "ONLY_TIMELOCK");
-        require(target != address(this), "SELF_PROTECTED");
-        require(target.code.length > 0, "NOT_CONTRACT");
+        if (msg.sender != address(this)) revert Unauthorized();
+        if (target == address(this)) revert Unauthorized();
+        if (target.code.length == 0) revert NotContract();
         allowedTargets[target] = isAllowed;
         emit AllowedTargetUpdated(target, isAllowed);
     }
 
     function setAllowedSelectors(address target, bytes4 selector, bool isAllowed) external {
-        require(msg.sender == address(this), "ONLY_TIMELOCK");
-        require(target != address(this), "SELF_PROTECTED");
-        require(allowedTargets[target], "TARGET_NOT_ALLOWED");
+        if (msg.sender != address(this)) revert Unauthorized();
+        if (target == address(this)) revert Unauthorized();
+        if (isAllowed && !allowedTargets[target]) revert TargetNotAllowed();
         allowedSelectors[target][selector] = isAllowed;
         emit AllowedSelectorUpdated(target, selector, isAllowed);
     }
@@ -329,8 +372,8 @@ contract ConstantOperator {
  * - Timelock enforced execution
  * - Selector + target whitelist enforcement
  *
- * ⚠ External call model:
- * Target contracts MUST enforce access control (e.g., onlySelf)
+ * External call model:
+ * Target contracts MUST enforce their own access control.
  *
  * === EXECUTION CONTEXT ===
  *
@@ -362,6 +405,8 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
     /// @notice Pending operation list (for off-chain/UI enumeration)
     bytes32[] public pendingOps;
 
+    /// @notice Maximum Limit on Pending Proposers per Owner
+    mapping(address => uint256) public ownerProposerNum;
 
     constructor(address owner1, address owner2, address owner3) Ownable3(owner1, owner2, owner3) {}
 
@@ -402,13 +447,13 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
     *   during execution (invalid encoding will revert)
     */
     function propose(address target, bytes4 selector, bytes calldata data, bytes32 salt) external onlyOwner returns (bytes32 opId){
-        require(allowedTargets[target], "TARGET_NOT_ALLOWED");
-        require(allowedSelectors[target][selector], "SELECTOR_NOT_ALLOWED");
+        if (!allowedTargets[target]) revert TargetNotAllowed();
+        if (!allowedSelectors[target][selector]) revert SelectorNotAllowed();
         // A maximum of 256 tasks can exist at a time. Tasks must be `cancel` or `execute` before another task can be added.
-        require(pendingOps.length < 256, "PENDING_TASK_UPPER_LIMIT");
+        if (pendingOps.length >= 256 || ownerProposerNum[msg.sender] >= 21) revert PendingLimit();
         opId = keccak256(abi.encode(target, selector, data, salt));
         // Prevent overwriting an active operation
-        require(operations[opId].id == 0, "ALREADY_EXISTS");
+        if (operations[opId].id != 0) revert AlreadyExists();
         operations[opId] = Operation({
             id: opId,
             selector: selector,
@@ -418,6 +463,7 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
             proposer: msg.sender,
             target: target
         });
+        ownerProposerNum[msg.sender]++;
         pendingOps.push(opId);
         emit OperationProposed(msg.sender, opId, target, selector, data);
     }
@@ -427,21 +473,21 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
     * @param opId Operation identifier
     *
     * @dev
-    * - This performs a low-level call to `address(this)`
-    * - Target functions MUST enforce `onlySelf`
+    * - This performs a low-level call to a whitelisted target
+    * - Target functions MUST enforce their own access control
     */
     function execute(bytes32 opId) external onlyOwner nonReentrant {
         Operation storage op = operations[opId];
-        require(op.id != 0, "NOT_FOUND");
-        require(msg.sender != op.proposer, "PROPOSER_CANNOT_EXECUTE");
-        require(allowedTargets[op.target], "TARGET_NOT_ALLOWED");
-        require(allowedSelectors[op.target][op.selector], "SELECTOR_NOT_ALLOWED");
+        if (op.id == 0) revert NotFound();
+        if (msg.sender == op.proposer) revert Unauthorized();
+        if (!allowedTargets[op.target]) revert TargetNotAllowed();
+        if (!allowedSelectors[op.target][op.selector]) revert SelectorNotAllowed();
         // If proposer is removed, the operation becomes permanently non-executable.
         // It can only be cancelled after the protection window expires.
-        require(_isOwner(op.proposer), "INVALID_PROPOSER");
-        require(!op.executed, "ALREADY_EXECUTED");
-        require(block.timestamp >= op.unlockTime, "TIMELOCK");
-        require(op.target.code.length > 0, "TARGET_NOT_CONTRACT");
+        if (!_isOwner(op.proposer)) revert InvalidOwner();
+        if (op.executed) revert AlreadyExecuted();
+        if (block.timestamp < op.unlockTime) revert Timelock();
+        if (op.target.code.length == 0) revert NotContract();
         // Effects
         op.executed = true;
         // Expose execution context for downstream contracts (audit / trace only)
@@ -456,9 +502,10 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
                     revert(add(returnData, 32), mload(returnData))
                 }
             } else {
-                revert("CALL_FAILED");
+                revert CallFailed();
             }
         }
+        _reduceOwnerProposerNum(op.proposer);
         _removePending(opId);
         emit OperationExecuted(op.proposer, msg.sender, opId, op.target, op.selector, op.data);
     }
@@ -469,20 +516,22 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
     *
     * @dev
     * - Within 2 * MIN_DELAY (6 days): only proposer can cancel
-    * - After that: Any active owner can cancel during the delay period
+    * - Subsequently: Any active owner may cancel after 6 days.
     *
     * Rationale:
     * - Prevent immediate cancellation after timelock unlock
     */
     function cancel(bytes32 opId) external onlyOwner {
         Operation storage op = operations[opId];
-        require(op.id != 0, "NOT_FOUND");
-        require(!op.executed, "ALREADY_EXECUTED");
+        if (op.id == 0) revert NotFound();
+        if (op.executed) revert AlreadyExecuted();
         // Protection window (first 6 days)
         if (block.timestamp < (op.unlockTime + MIN_DELAY)) {
-            require(msg.sender == op.proposer || !_isOwner(op.proposer), "ONLY_PROPOSER");
+            // Only the proposer (or if the proposer has lost their owner status) can cancel.
+            if (msg.sender != op.proposer && _isOwner(op.proposer)) revert Unauthorized();
         }
         emit OperationCancelled(op.proposer, msg.sender, opId, op.target, op.selector, op.data);
+        _reduceOwnerProposerNum(op.proposer);
         delete operations[opId];
         _removePending(opId);
     }
@@ -500,12 +549,30 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
         }
     }
 
+    function _reduceOwnerProposerNum(address _owner) internal {
+        uint256 count = ownerProposerNum[_owner];
+        if (count != 0) {
+            unchecked { ownerProposerNum[_owner] = count - 1; }
+        }
+    }
 
     /* ---------------------------- View Functions --------------------------- */
 
-
-    function getOwners() public view returns (address[3] memory) {
-        return owners;
+    struct OwnersInfo {
+        address owner;
+        uint256 pendingProposerNum;
+    }
+    function getOwners() public view returns (OwnersInfo[] memory) {
+        OwnersInfo[] memory _ownersInfo = new OwnersInfo[](3);
+        for (uint256 i = 0; i < 3; ) {
+            address owner = owners[i];
+            _ownersInfo[i] = OwnersInfo({
+                owner: owner,
+                pendingProposerNum: ownerProposerNum[owner]
+            });
+            unchecked { ++i; }
+        }
+        return _ownersInfo;
     }
 
     function isExecutable(bytes32 opId) external view returns (bool) {
@@ -514,12 +581,11 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
             op.id != 0 &&
             !op.executed &&
             block.timestamp >= op.unlockTime &&
-            _isOwner(op.proposer)
+            _isOwner(op.proposer) &&
+            allowedTargets[op.target] &&
+            allowedSelectors[op.target][op.selector] &&
+            op.target.code.length > 0
         );
-    }
-
-    function getTransferOwnership() external view returns (PendingOwnershipTransfer memory) {
-        return pendingTransfer;
     }
 
     function getOperation(bytes32 opId) external view returns (Operation memory) {
@@ -542,15 +608,14 @@ contract SwaptoXTimelock is Ownable3, ConstantOperator {
         uint256 guardianActivationTime;
     }
     function getGuardianInfo() public view returns (GuardianInfo memory) {
-        GuardianInfo memory _guardianInfo = GuardianInfo({
+        return GuardianInfo({
             guardian: guardian,
             isGuardianActive: isGuardianActive,
             guardianActivationTime: guardianActivationTime
         });
-        return _guardianInfo;
     }
 
-    function getUiViewData() external view returns (address[3] memory, Operation[] memory, PendingOwnershipTransfer memory, GuardianInfo memory, uint256) {
+    function getUiViewData() external view returns (OwnersInfo[] memory, Operation[] memory, PendingOwnershipTransfer memory, GuardianInfo memory, uint256) {
         return (getOwners(), getPendingOps(), pendingTransfer, getGuardianInfo(), block.timestamp);
     }
 
