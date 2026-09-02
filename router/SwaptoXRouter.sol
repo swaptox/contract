@@ -63,6 +63,7 @@ interface ITimelockContext {
 
 contract OwnerContract {
 
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event WalletAddressSet(bytes32 indexed opId, address indexed previousWallet, address indexed newWallet);
     event SwapAddressSet(bytes32 indexed opId, uint256 indexed version, address indexed newAddress);
     event FeeTokenChanged(bytes32 indexed opId, address indexed token, uint8 fee);
@@ -96,7 +97,7 @@ contract OwnerContract {
 
     /// @notice Default swap fee (basis points)
     /// default fee in basis points (1 BP = 0.01%)
-    /// capped to 30 BP (0.3%) by design
+    /// capped to 20 BP (0.2%) by design
     uint8 public defaultFeeBP = 0; 
 
     /// @notice Tokens that are completely exempt from swap fees
@@ -151,14 +152,14 @@ contract OwnerContract {
      * @dev Fixes ambiguity between:
      * - token without custom fee
      * - token with custom fee set to zero
-     * - fee is capped at 30 BP (0.3%) by design
+     * - fee is capped at 20 BP (0.2%) by design
      *
      * If fee == 0:
      *   custom fee configuration is considered disabled.
      */
     function setCustomFeeToken(address token, uint8 fee) external onlySelf {
         require(block.timestamp >= maxFreeTime, "SwaptoX: Free period of the agreement");
-        require(30 >= fee, "SwaptoX: invalid fee value"); // Maximum 0.3%, avoid triggering high agreement fees.
+        require(20 >= fee, "SwaptoX: invalid fee value"); // Maximum 0.2%, avoid triggering high agreement fees.
         customFeeBP[token] = fee;
         emit FeeTokenChanged(_getOpId(), token, fee);
     }
@@ -166,7 +167,7 @@ contract OwnerContract {
     /// @notice Update global default swap fee
     function setDefaultSwapFee(uint8 fee) external onlySelf {
         require(block.timestamp >= maxFreeTime, "SwaptoX: Free period of the agreement");
-        require(30 >= fee, "SwaptoX: invalid default fee"); // Maximum 0.3%, avoid triggering high agreement fees.
+        require(20 >= fee, "SwaptoX: invalid default fee"); // Maximum 0.2%, avoid triggering high agreement fees.
         defaultFeeBP = fee;
         emit DefaultFeeChanged(_getOpId(), fee);
     }
@@ -305,6 +306,16 @@ contract OwnerContract {
         actualSwapAmount = amount - feeAmount;
     }
 
+    /* ---------------------------- Ownership helpers --------------------------- */
+
+    /// @notice EOA wallets are permitted to be set as administrators, but this setting becomes locked once switched to a contract address.
+    function transferOwnership(address newOwner) public onlySelf {
+        require(admin.code.length == 0, "SwaptoX: The admin account has been locked");
+        require(newOwner != address(0), "SwaptoX: new owner cannot be zero");
+        address oldOwner = admin;
+        admin = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
 }
 
 contract InviterContract {
@@ -542,7 +553,11 @@ contract SwaptoXRouter is OwnerContract, InviterContract {
         if (address(desc.tokenIn) == ERC20Helper.ETH_ADDRESS) {
             require(msg.value > 0 && msg.value == desc.amountIn, "SwaptoX: invalid input");
             realInput = msg.value;
-            amountOut = ETH2token(desc, realInput);
+            if(desc.tokenOut == WETH){
+                amountOut = _native2Wrapped(desc, realInput);
+            }else{
+                amountOut = ETH2token(desc, realInput);
+            }
         } else {
             require(msg.value == 0, "SwaptoX: no ETH allowed for ERC20 input");
             if (desc.permitData.length > 0) {
@@ -551,7 +566,11 @@ contract SwaptoXRouter is OwnerContract, InviterContract {
             realInput = safetyTransferIn(desc.tokenIn, desc.amountIn);
 
             if (address(desc.tokenOut) == ERC20Helper.ETH_ADDRESS) {
-                amountOut = token2ETH(desc, realInput);
+                if (desc.tokenIn == WETH) {
+                    amountOut = _wrapped2native(desc, realInput);
+                }else{
+                    amountOut = token2ETH(desc, realInput);
+                }
             } else {
                 amountOut = token2token(desc, realInput);
             }
@@ -588,51 +607,27 @@ contract SwaptoXRouter is OwnerContract, InviterContract {
     }
 
     // @notice Wraps native ETH into WETH (Wrapped Token)
-    function native2Wrapped(
+    function _native2Wrapped(
         SwapParameter calldata desc,
-        uint256 deadline
-    ) external payable nonReentrant ensure(deadline) returns (uint256 amountOut, uint256 gasUsed) {
-        uint256 gasBefore = gasleft();
-        require(address(desc.tokenIn) == ERC20Helper.ETH_ADDRESS, "SwaptoX: invalid tokenIn");
-        require(desc.tokenOut == WETH, "SwaptoX: invalid tokenOut");
-        require(msg.value > 0&&msg.value == desc.amountIn, "SwaptoX: invalid amountIn");
-        require(desc.amountMinOut > 0 && desc.amountMinOut <= desc.amountIn, "SwaptoX: invalid amountMinOut");
-        require(desc.recipient != address(0)&&desc.recipient != address(this), "SwaptoX: invalid recipient");
-        uint256 realInput = msg.value;
+        uint256 realInput
+    ) internal returns (uint256 amountOut) {
         IWETH(WETH).deposit{value: realInput}();
         uint256 balanceBefore = ERC20Helper.balanceOf(WETH, desc.recipient);
         ERC20Helper.safeTransfer(WETH, desc.recipient, realInput);
         uint256 balanceAfter = ERC20Helper.balanceOf(WETH, desc.recipient);
         require(balanceAfter >= (balanceBefore + desc.amountMinOut), "SwaptoX: insufficient output received");
         amountOut = balanceAfter - balanceBefore;
-        unchecked {
-            gasUsed = gasBefore - gasleft();
-        }
     }
 
     // @notice Unwraps WETH into native ETH
-    function wrapped2native(
+    function _wrapped2native(
         SwapParameter calldata desc,
-        uint256 deadline
-    ) external nonReentrant ensure(deadline) returns (uint256 amountOut, uint256 gasUsed) {
-        uint256 gasBefore = gasleft();
-        require(desc.tokenIn == WETH, "SwaptoX: invalid tokenIn");
-        require(desc.tokenOut == ERC20Helper.ETH_ADDRESS, "SwaptoX: invalid tokenOut");
-        require(desc.amountIn > 0, "SwaptoX: invalid amountIn");
-        require(desc.amountMinOut > 0, "SwaptoX: invalid amountMinOut");
-        require(desc.recipient != address(0)&&desc.recipient != address(this), "SwaptoX: invalid recipient");
-        uint256 realInput;
-        if (desc.permitData.length > 0) {
-            ERC20Helper.permit(desc.tokenIn, desc.permitData);
-        }
-        realInput = safetyTransferIn(desc.tokenIn, desc.amountIn);
+        uint256 realInput
+    ) internal returns (uint256 amountOut) {
         require(realInput >= desc.amountMinOut, "SwaptoX: amountMinOut insufficient");
         IWETH(WETH).withdraw(realInput);
         ERC20Helper.safeTransferETH(desc.recipient, realInput);
         amountOut = realInput;
-        unchecked {
-            gasUsed = gasBefore - gasleft();
-        }
     }
 
 }
